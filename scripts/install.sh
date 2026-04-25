@@ -108,13 +108,17 @@ case "$KERN" in
 esac
 
 SUDO=
+IS_ROOT=
 if [ "$(id -u)" -ne 0 ]; then
+    IS_ROOT=false
     # Running as root, no need for sudo
     if ! available sudo; then
         error "This script requires superuser permissions. Please re-run as root."
     fi
 
     SUDO="sudo"
+else
+    IS_ROOT=true
 fi
 
 NEEDS=$(require curl awk grep sed tee xargs)
@@ -141,33 +145,60 @@ download_and_extract() {
   - RHEL/CentOS/Fedora: sudo dnf install zstd
   - Arch: sudo pacman -S zstd"
         fi
-
+        if [ $IS_ROOT ]; then
+            TAR="$SUDO tar"
+        else
+            TAR="tar"
+        if
         status "Downloading ${filename}.tar.zst"
         curl --fail --show-error --location --progress-bar \
             "${url_base}/${filename}.tar.zst${VER_PARAM}" | \
-            zstd -d | $SUDO tar -xf - -C "${dest_dir}"
+            zstd -d | $TAR -xf - -C "${dest_dir}"
         return 0
     fi
-
     # Fall back to .tgz for older versions
+    if [ $IS_ROOT ]; then
+        TAR="$SUDO tar"
+    else
+        TAR="tar"
+    fi
     status "Downloading ${filename}.tgz"
     curl --fail --show-error --location --progress-bar \
         "${url_base}/${filename}.tgz${VER_PARAM}" | \
-        $SUDO tar -xzf - -C "${dest_dir}"
+        $TAR -xzf - -C "${dest_dir}"
 }
-
-for BINDIR in /usr/local/bin /usr/bin /bin; do
-    echo $PATH | grep -q $BINDIR && break || continue
-done
+if [ $IS_ROOT ]; then
+    for BINDIR in /usr/local/bin /usr/bin /bin; do
+        echo $PATH | grep -q $BINDIR && break || continue
+    done
+else
+    for BINDIR in $HOME/.local/bin $HOME/bin; do
+        echo $PATH | grep -q $BINDIR && break || continue
+    done
+fi
 OLLAMA_INSTALL_DIR=$(dirname ${BINDIR})
-
+status "Installing ollama to $OLLAMA_INSTALL_DIR"
+read -p "Continue: [Y/n] " -n 1 -r
+echo
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo "Installation cancelled by user."
+    exit 1
+fi
 if [ -d "$OLLAMA_INSTALL_DIR/lib/ollama" ] ; then
     status "Cleaning up old version at $OLLAMA_INSTALL_DIR/lib/ollama"
-    $SUDO rm -rf "$OLLAMA_INSTALL_DIR/lib/ollama"
+    if [ $IS_ROOT ]; then
+        $SUDO rm -rf "$OLLAMA_INSTALL_DIR/lib/ollama"
+    else
+        rm -rf "$OLLAMA_INSTALL_DIR/lib/ollama"
+    fi
 fi
-status "Installing ollama to $OLLAMA_INSTALL_DIR"
-$SUDO install -o0 -g0 -m755 -d $BINDIR
-$SUDO install -o0 -g0 -m755 -d "$OLLAMA_INSTALL_DIR/lib/ollama"
+if [ $IS_ROOT ]; then
+    $SUDO install -o0 -g0 -m755 -d $BINDIR
+    $SUDO install -o0 -g0 -m755 -d "$OLLAMA_INSTALL_DIR/lib/ollama"
+else
+    install -d $BINDIR
+    install -d "$OLLAMA_INSTALL_DIR/lib/ollama"
+fi
 download_and_extract "https://ollama.com/download" "$OLLAMA_INSTALL_DIR" "ollama-linux-${ARCH}"
 
 if [ "$OLLAMA_INSTALL_DIR/bin/ollama" != "$BINDIR/ollama" ] ; then
@@ -246,9 +277,43 @@ EOF
             ;;
     esac
 }
-
+configure_systemd_user() {
+    status "Creating ollama systemd user service..."
+    cat <<EOF | tee $HOME/.config/systemd/user/ollama.service >/dev/null
+[Unit]
+Description=Ollama Service
+After=network-online.target
+[Service]
+ExecStart=$BINDIR/ollama serve
+Restart=always
+RestartSec=3
+Environment="PATH=$PATH"
+[Install]
+WantedBy=default.target
+EOF
+    SYSTEMCTL_RUNNING="$(systemctl --user is-system-running || true)"
+    case $SYSTEMCTL_RUNNING in
+        running|degraded)
+            status "Enabling and starting ollama service..."
+            systemctl --user daemon-reload
+            systemctl --user enable ollama
+            start_service() { systemctl --user restart ollama; }
+            trap start_service EXIT
+            ;;
+        *)
+            warning "systemd is not running"
+            if [ "$IS_WSL2" = true ]; then
+                warning "see https://learn.microsoft.com/en-us/windows/wsl/systemd#how-to-enable-systemd to enable it"
+            fi
+            ;;
+    esac
+}
 if available systemctl; then
-    configure_systemd
+    if [ $IS_ROOT ]; then
+        configure_systemd
+    else
+        configure_systemd_user
+    fi
 fi
 
 # WSL2 only supports GPUs via nvidia passthrough
@@ -450,6 +515,75 @@ fi
 
 status "NVIDIA GPU ready."
 install_success
+}
+
+uninstall_ollama() {
+    echo "Starting Ollama uninstallation..."
+    # Remove Ollama binaries and files
+    echo "Removing Ollama binaries..."
+    rm -rf $BINDIR/bin/ollama
+    rm -rf $BINDIR/lib/ollama
+    # Remove systemd service if it exists
+    echo "Removing systemd service..."
+    systemctl --user stop ollama 2>/dev/null || true
+    systemctl --user disable ollama 2>/dev/null || true
+    rm -f $HOME/.config/systemd/user/ollama.service
+    # # Remove Ollama user if it exists
+    # echo "Removing Ollama user..."
+    # userdel ollama 2>/dev/null || true
+    # # Remove temporary files
+    # echo "Cleaning up temporary files..."
+    # rm -rf /tmp/ollama_*
+    # Remove GPU-specific dependencies
+    echo "Checking for GPU dependencies..."
+    # Check for NVIDIA GPU dependencies
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        echo "Removing NVIDIA GPU dependencies..."
+        $SUDO apt-get purge nvidia-* cuda-* 2>/dev/null || true
+        $SUDO dnf remove nvidia-* cuda-* 2>/dev/null || true
+        $SUDO modprobe -r nvidia nvidia_uvm 2>/dev/null || true
+        $SUDO rmmod nvidia 2>/dev/null || true
+        $SUDO rmmod nvidia_uvm 2>/dev/null || true
+    fi
+    # Check for AMD GPU dependencies
+    if command -v rocm-* >/dev/null 2>&1; then
+        echo "Removing AMD GPU dependencies..."
+        $SUDO apt-get purge rocm-* 2>/dev/null || true
+        $SUDO dnf remove rocm-* 2>/dev/null || true
+    fi
+    # Remove NVIDIA kernel modules and dependencies
+    if [ -f /etc/nv_tegra_release ]; then
+        echo "Removing JetPack dependencies..."
+        $SUDO apt-get purge jetpack-* 2>/dev/null || true
+        $SUDO dnf remove jetpack-* 2>/dev/null || true
+    else
+        echo "Checking for NVIDIA CUDA dependencies..."
+        if [ -f /etc/os-release ]; then
+            . /etc/os-release
+            case $ID in
+                debian|ubuntu)
+                    $SUDO apt-get purge cuda-* 2>/dev/null || true
+                    ;;
+                centos|rhel|fedora|rocky)
+                    $SUDO dnf remove cuda-* 2>/dev/null || true
+                    ;;
+            esac
+        fi
+    fi
+    # Remove NVIDIA modules configuration
+    echo "Removing NVIDIA module configurations..."
+    $SUDO rm -f /etc/modules-load.d/nvidia.conf 2>/dev/null || true
+    # Reload systemd to ensure no lingering services
+    echo "Reloading systemd..."
+    $SUDO systemctl daemon-reload
+    # Verify removal
+    echo "Verifying removal..."
+    if command -v ollama >/dev/null 2>&1; then
+        echo "ERROR: Ollama is still accessible. Check if it was fully removed."
+    else
+        echo "Ollama has been successfully uninstalled."
+    fi
+    echo "Uninstallation complete."
 }
 
 main
